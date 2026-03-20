@@ -4,6 +4,8 @@ import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.hmdp.config.CaffeineConfigProperties;
 import com.hmdp.config.BloomConfigProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RBloomFilter;
@@ -12,6 +14,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -21,17 +24,242 @@ import java.util.function.Function;
 @Slf4j
 public class CacheClient {
 
+    private static final String LOCAL_NULL_VALUE = "__NULL__";
+
     private final StringRedisTemplate stringRedisTemplate;
     private final RedissonClient redissonClient;
     private final BloomConfigProperties bloomConfigProperties;
+    private final CaffeineConfigProperties caffeineConfigProperties;
+    private final Cache<String, Object> localL1Cache;
 
     public CacheClient(
             StringRedisTemplate stringRedisTemplate,
             RedissonClient redissonClient,
-            BloomConfigProperties bloomConfigProperties) {
+            BloomConfigProperties bloomConfigProperties,
+            CaffeineConfigProperties caffeineConfigProperties,
+            Cache<String, Object> localL1Cache) {
         this.stringRedisTemplate = stringRedisTemplate;
         this.redissonClient = redissonClient;
         this.bloomConfigProperties = bloomConfigProperties;
+        this.caffeineConfigProperties = caffeineConfigProperties;
+        this.localL1Cache = localL1Cache;
+    }
+
+    public <R, ID> R queryWithL1L2PassThrough(
+            String keyPrefix,
+            ID id,
+            Class<R> type,
+            Function<ID, R> dbFallback,
+            Long l1Time,
+            TimeUnit l1Unit,
+            Long l2Time,
+            TimeUnit l2Unit) {
+        String key = keyPrefix + id;
+        R local = readFromLocalCache(key, type);
+        if (local != null || isLocalNullValue(key)) {
+            return local;
+        }
+
+        R r = queryWithPassThrough(keyPrefix, id, type, dbFallback, l2Time, l2Unit);
+        writeToLocalCache(key, r, l1Time, l1Unit);
+        return r;
+    }
+
+    public <R, ID> R queryWithL1L2BloomPassThrough(
+            String keyPrefix,
+            String bloomKey,
+            ID id,
+            Class<R> type,
+            Function<ID, R> dbFallback,
+            Long l1Time,
+            TimeUnit l1Unit,
+            Long l2Time,
+            TimeUnit l2Unit) {
+        String key = keyPrefix + id;
+        R local = readFromLocalCache(key, type);
+        if (local != null || isLocalNullValue(key)) {
+            return local;
+        }
+
+        R r = queryWithBloomPassThrough(keyPrefix, bloomKey, id, type, dbFallback, l2Time, l2Unit);
+        writeToLocalCache(key, r, l1Time, l1Unit);
+        return r;
+    }
+
+    public <R> R querySingleKeyWithL1L2PassThrough(
+            String key,
+            Class<R> type,
+            Function<String, R> dbFallback,
+            Long l1Time,
+            TimeUnit l1Unit,
+            Long l2Time,
+            TimeUnit l2Unit) {
+        R local = readFromLocalCache(key, type);
+        if (local != null || isLocalNullValue(key)) {
+            return local;
+        }
+
+        R r = querySingleKeyWithPassThrough(key, type, dbFallback, l2Time, l2Unit);
+        writeToLocalCache(key, r, l1Time, l1Unit);
+        return r;
+    }
+
+    public <R> List<R> querySingleKeyListWithL1L2PassThrough(
+            String key,
+            Class<R> elementType,
+            Function<String, List<R>> dbFallback,
+            Long l1Time,
+            TimeUnit l1Unit,
+            Long l2Time,
+            TimeUnit l2Unit) {
+        List<R> local = readListFromLocalCache(key, elementType);
+        if (local != null || isLocalNullValue(key)) {
+            return local;
+        }
+
+        List<R> r = querySingleKeyListWithPassThrough(key, elementType, dbFallback, l2Time, l2Unit);
+        writeToLocalCache(key, r, l1Time, l1Unit);
+        return r;
+    }
+
+    public void invalidateLocalCache(String key) {
+        if (!caffeineConfigProperties.isEnabled()) {
+            return;
+        }
+        localL1Cache.invalidate(key);
+    }
+
+    private <R> R querySingleKeyWithPassThrough(
+            String key,
+            Class<R> type,
+            Function<String, R> dbFallback,
+            Long time,
+            TimeUnit unit) {
+        String json = stringRedisTemplate.opsForValue().get(key);
+        if (StrUtil.isNotBlank(json)) {
+            return JSONUtil.toBean(json, type);
+        }
+        if (json != null) {
+            return null;
+        }
+
+        R r = dbFallback.apply(key);
+        if (r == null) {
+            stringRedisTemplate.opsForValue().set(key, "", RedisConstants.CACHE_NULL_TTL, TimeUnit.MINUTES);
+            return null;
+        }
+        this.set(key, r, time, unit);
+        return r;
+    }
+
+    private <R> List<R> querySingleKeyListWithPassThrough(
+            String key,
+            Class<R> elementType,
+            Function<String, List<R>> dbFallback,
+            Long time,
+            TimeUnit unit) {
+        String json = stringRedisTemplate.opsForValue().get(key);
+        if (StrUtil.isNotBlank(json)) {
+            return JSONUtil.toList(json, elementType);
+        }
+        if (json != null) {
+            return null;
+        }
+
+        List<R> r = dbFallback.apply(key);
+        if (r == null || r.isEmpty()) {
+            stringRedisTemplate.opsForValue().set(key, "", RedisConstants.CACHE_NULL_TTL, TimeUnit.MINUTES);
+            return null;
+        }
+        this.set(key, r, time, unit);
+        return r;
+    }
+
+    private <R> R readFromLocalCache(String key, Class<R> type) {
+        if (!caffeineConfigProperties.isEnabled()) {
+            return null;
+        }
+        Object cached = localL1Cache.getIfPresent(key);
+        if (!(cached instanceof LocalCacheValue)) {
+            return null;
+        }
+
+        LocalCacheValue localCacheValue = (LocalCacheValue) cached;
+        if (localCacheValue.expired()) {
+            localL1Cache.invalidate(key);
+            return null;
+        }
+        if (LOCAL_NULL_VALUE.equals(localCacheValue.value)) {
+            return null;
+        }
+        return JSONUtil.toBean(localCacheValue.value, type);
+    }
+
+    private <R> List<R> readListFromLocalCache(String key, Class<R> elementType) {
+        if (!caffeineConfigProperties.isEnabled()) {
+            return null;
+        }
+        Object cached = localL1Cache.getIfPresent(key);
+        if (!(cached instanceof LocalCacheValue)) {
+            return null;
+        }
+
+        LocalCacheValue localCacheValue = (LocalCacheValue) cached;
+        if (localCacheValue.expired()) {
+            localL1Cache.invalidate(key);
+            return null;
+        }
+        if (LOCAL_NULL_VALUE.equals(localCacheValue.value)) {
+            return null;
+        }
+        return JSONUtil.toList(localCacheValue.value, elementType);
+    }
+
+    private boolean isLocalNullValue(String key) {
+        if (!caffeineConfigProperties.isEnabled()) {
+            return false;
+        }
+        Object cached = localL1Cache.getIfPresent(key);
+        if (!(cached instanceof LocalCacheValue)) {
+            return false;
+        }
+
+        LocalCacheValue localCacheValue = (LocalCacheValue) cached;
+        if (localCacheValue.expired()) {
+            localL1Cache.invalidate(key);
+            return false;
+        }
+        return LOCAL_NULL_VALUE.equals(localCacheValue.value);
+    }
+
+    private void writeToLocalCache(String key, Object value, Long time, TimeUnit unit) {
+        if (!caffeineConfigProperties.isEnabled()) {
+            return;
+        }
+
+        Long expireAt = System.currentTimeMillis() + unit.toMillis(time);
+        if (value == null) {
+            localL1Cache.put(
+                    key,
+                    new LocalCacheValue(LOCAL_NULL_VALUE,
+                            System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(RedisConstants.CACHE_NULL_L1_TTL_SECONDS)));
+            return;
+        }
+        localL1Cache.put(key, new LocalCacheValue(JSONUtil.toJsonStr(value), expireAt));
+    }
+
+    private static class LocalCacheValue {
+        private final String value;
+        private final long expireAtMillis;
+
+        private LocalCacheValue(String value, long expireAtMillis) {
+            this.value = value;
+            this.expireAtMillis = expireAtMillis;
+        }
+
+        private boolean expired() {
+            return System.currentTimeMillis() >= expireAtMillis;
+        }
     }
 
     public void set(String key, Object value, Long time, TimeUnit unit) {

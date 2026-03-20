@@ -28,6 +28,10 @@ logging:
 
 hmdp:
   cache:
+    caffeine:
+      enabled: true
+      max-size: 10000
+      default-ttl-seconds: 300
     bloom:
       enabled: false
       shop-expected-insertions: 200000

@@ -50,14 +50,16 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
         //逻辑过期解决缓存击穿
         Shop shop = cacheClient.
-                queryWithBloomPassThrough(
+            queryWithL1L2BloomPassThrough(
                         RedisConstants.CACHE_SHOP_KEY,
                         RedisConstants.BLOOM_SHOP_ID_KEY,
                         id,
                         Shop.class,
                         this::getById,
-                        20L,
-                        TimeUnit.SECONDS);
+                RedisConstants.CACHE_SHOP_L1_TTL_SECONDS,
+                TimeUnit.SECONDS,
+                RedisConstants.CACHE_SHOP_TTL,
+                TimeUnit.MINUTES);
         if (shop == null) {
             return Result.fail("店铺不存在！");
         }
@@ -231,6 +233,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         updateById(shop);
         //2.删除缓存
         stringRedisTemplate.delete(RedisConstants.CACHE_SHOP_KEY + id);
+        cacheClient.invalidateLocalCache(RedisConstants.CACHE_SHOP_KEY + id);
         return Result.ok();
     }
 

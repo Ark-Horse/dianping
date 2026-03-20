@@ -1,19 +1,17 @@
 package com.hmdp.service.impl;
 
-import cn.hutool.core.util.StrUtil;
-import cn.hutool.json.JSONUtil;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.ShopType;
 import com.hmdp.mapper.ShopTypeMapper;
 import com.hmdp.service.IShopTypeService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisConstants;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
-import javax.management.Query;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * <p>
@@ -27,28 +25,22 @@ import java.util.List;
 public class ShopTypeServiceImpl extends ServiceImpl<ShopTypeMapper, ShopType> implements IShopTypeService {
 
     @Resource
-    private StringRedisTemplate stringRedisTemplate;
+    private CacheClient cacheClient;
 
     @Override
     public Result queryTypeString() {
+        List<ShopType> shopTypes = cacheClient.querySingleKeyListWithL1L2PassThrough(
+                RedisConstants.CACHE_SHOP_TYPE_KEY,
+            ShopType.class,
+                key -> query().orderByAsc("sort").list(),
+                RedisConstants.CACHE_SHOP_TYPE_L1_TTL_SECONDS,
+                TimeUnit.SECONDS,
+                RedisConstants.CACHE_SHOP_TYPE_TTL,
+                TimeUnit.MINUTES);
 
-
-        String shopTypeJSON = stringRedisTemplate.opsForValue().get(RedisConstants.CACHE_SHOP_TYPE_KEY);
-        if(StrUtil.isNotBlank(shopTypeJSON)) {
-            List<ShopType> shopTypes = JSONUtil.toList(shopTypeJSON, ShopType.class);
-
-            return Result.ok(shopTypes);
-        }
-
-        List<ShopType> shopTypes = query().orderByAsc("sort").list();
-
-        if(shopTypes == null || shopTypes.isEmpty()) {
+        if (shopTypes == null || shopTypes.isEmpty()) {
             return Result.fail("分类不存在！！！");
         }
-
-        stringRedisTemplate.opsForValue().set(RedisConstants.CACHE_SHOP_TYPE_KEY, JSONUtil.toJsonStr(shopTypes));
-
-
         return Result.ok(shopTypes);
     }
 }
