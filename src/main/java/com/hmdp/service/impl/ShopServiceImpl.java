@@ -67,7 +67,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         //2.判断是否存在
         if (StrUtil.isBlank(shopJson)) {
             //3.存在，直接返回
-            return JSONUtil.toBean(shopJson, Shop.class);
+            return null;
         }
         //4.命中，需要先把json反序列化为对象
         RedisData redisData = JSONUtil.toBean(shopJson, RedisData.class);
