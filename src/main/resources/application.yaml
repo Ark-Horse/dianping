@@ -25,3 +25,11 @@ mybatis-plus:
 logging:
   level:
     com.hmdp: debug
+
+hmdp:
+  cache:
+    bloom:
+      enabled: false
+      shop-expected-insertions: 200000
+      shop-false-positive-rate: 0.01
+      rebuild-cron: "0 0 4 * * ?"

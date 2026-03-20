@@ -4,11 +4,12 @@ import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
-import com.hmdp.entity.Shop;
+import com.hmdp.config.BloomConfigProperties;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RBloomFilter;
+import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
-import org.yaml.snakeyaml.events.Event;
 
 import java.time.LocalDateTime;
 import java.util.concurrent.ExecutorService;
@@ -20,10 +21,17 @@ import java.util.function.Function;
 @Slf4j
 public class CacheClient {
 
-    private StringRedisTemplate stringRedisTemplate;
+    private final StringRedisTemplate stringRedisTemplate;
+    private final RedissonClient redissonClient;
+    private final BloomConfigProperties bloomConfigProperties;
 
-    public CacheClient(StringRedisTemplate stringRedisTemplate) {
+    public CacheClient(
+            StringRedisTemplate stringRedisTemplate,
+            RedissonClient redissonClient,
+            BloomConfigProperties bloomConfigProperties) {
         this.stringRedisTemplate = stringRedisTemplate;
+        this.redissonClient = redissonClient;
+        this.bloomConfigProperties = bloomConfigProperties;
     }
 
     public void set(String key, Object value, Long time, TimeUnit unit) {
@@ -69,6 +77,49 @@ public class CacheClient {
         this.set(key,r,time,unit);
         //7.返回
         return r;
+    }
+
+    public <R, ID> R queryWithBloomPassThrough(
+            String keyPrefix, String bloomKey, ID id, Class<R> type, Function<ID,R> dbFallback, Long time, TimeUnit unit) {
+        if (!bloomConfigProperties.isEnabled()) {
+            return queryWithPassThrough(keyPrefix, id, type, dbFallback, time, unit);
+        }
+
+        RBloomFilter<String> bloomFilter = redissonClient.getBloomFilter(bloomKey);
+        try {
+            if (!bloomFilter.isExists()) {
+                log.warn("Bloom filter {} is not initialized, fallback to normal pass-through", bloomKey);
+                return queryWithPassThrough(keyPrefix, id, type, dbFallback, time, unit);
+            }
+            if (!bloomFilter.contains(String.valueOf(id))) {
+                log.debug("Bloom filtered invalid id={}, bloomKey={}", id, bloomKey);
+                return null;
+            }
+        } catch (Exception e) {
+            log.warn("Bloom check failed, fallback to normal pass-through, bloomKey={}, id={}", bloomKey, id, e);
+            return queryWithPassThrough(keyPrefix, id, type, dbFallback, time, unit);
+        }
+
+        return queryWithPassThrough(keyPrefix, id, type, dbFallback, time, unit);
+    }
+
+    public boolean addToBloom(String bloomKey, Object value) {
+        if (!bloomConfigProperties.isEnabled() || value == null) {
+            return false;
+        }
+
+        RBloomFilter<String> bloomFilter = redissonClient.getBloomFilter(bloomKey);
+        try {
+            if (!bloomFilter.isExists()) {
+                bloomFilter.tryInit(
+                        bloomConfigProperties.getShopExpectedInsertions(),
+                        bloomConfigProperties.getShopFalsePositiveRate());
+            }
+            return bloomFilter.add(String.valueOf(value));
+        } catch (Exception e) {
+            log.warn("Add value to bloom failed, bloomKey={}, value={}", bloomKey, value, e);
+            return false;
+        }
     }
 
     private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);

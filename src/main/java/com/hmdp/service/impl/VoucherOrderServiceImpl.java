@@ -13,23 +13,26 @@ import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.aop.framework.AopContext;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.context.event.EventListener;
+import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import javax.annotation.Resource;
+import java.net.InetAddress;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * <p>
@@ -55,6 +58,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private RedissonClient redissonClient;
 
+    @Resource
+    private Environment environment;
+
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT ;
     static {
         SECKILL_SCRIPT = new DefaultRedisScript<>();
@@ -63,25 +69,59 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     }
 
 
-    private ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
+    private static final String ORDER_STREAM_KEY = "stream.orders";
+    private static final String ORDER_CONSUMER_GROUP = "g1";
 
-    @PostConstruct
-    private void init(){
-        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
+    private final ExecutorService seckillOrderExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r);
+        t.setName("voucher-order-consumer");
+        return t;
+    });
+
+    private final AtomicBoolean running = new AtomicBoolean(false);
+    private final AtomicBoolean started = new AtomicBoolean(false);
+    private String consumerName = "c1";
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void onApplicationReady() {
+        if (!started.compareAndSet(false, true)) {
+            return;
+        }
+        this.consumerName = buildConsumerName();
+        this.running.set(true);
+        seckillOrderExecutor.submit(new VoucherOrderHandler());
+        log.info("Voucher order consumer started, group={}, consumer={}", ORDER_CONSUMER_GROUP, consumerName);
+    }
+
+    @PreDestroy
+    public void destroy() {
+        running.set(false);
+        seckillOrderExecutor.shutdownNow();
+        log.info("Voucher order consumer stopped, consumer={}", consumerName);
+    }
+
+    private String buildConsumerName() {
+        String appName = environment.getProperty("spring.application.name", "hmdp");
+        String port = environment.getProperty("server.port", "8080");
+        String host = "unknown-host";
+        try {
+            host = InetAddress.getLocalHost().getHostName();
+        } catch (Exception e) {
+            log.warn("Failed to resolve host name, use default consumer name prefix", e);
+        }
+        return appName + "-" + host + "-" + port;
     }
 
     private class VoucherOrderHandler implements Runnable {
-        String queueName = "stream.orders";
-
         @Override
         public void run() {
-            while (true){
+            while (running.get() && !Thread.currentThread().isInterrupted()) {
                 try {
                     //1.获取消息队列中的订单信息 XREADGROUP GROUP g1 c1(先写死) COUNT 1 BLOCK 2000 STREAMS stream.orders >
                     List<MapRecord<String, Object, Object>> read = stringRedisTemplate.opsForStream().read(
-                            Consumer.from("g1", "c1"),
+                            Consumer.from(ORDER_CONSUMER_GROUP, consumerName),
                             StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
-                            StreamOffset.create(queueName, ReadOffset.lastConsumed())
+                            StreamOffset.create(ORDER_STREAM_KEY, ReadOffset.lastConsumed())
                     );
 
                     //2.判断消息是否获取成功
@@ -98,9 +138,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     //4.若成功，可以下单
                     handleVocherOrder(voucherOrder);
                     //5.ACK确认 SACK stream.orders g1 id
-                    stringRedisTemplate.opsForStream().acknowledge(queueName,"g1",record.getId());
+                    stringRedisTemplate.opsForStream().acknowledge(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, record.getId());
 
                 } catch (Exception e) {
+                    if (!running.get()) {
+                        break;
+                    }
                     log.error("处理订单异常",e);
                     handlePendingList();
                 }
@@ -108,13 +151,13 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
 
         private void handlePendingList() {
-            while (true){
+            while (running.get() && !Thread.currentThread().isInterrupted()) {
                 try {
                     //1.获取pending-list中的订单信息 XREADGROUP GROUP g1 c1(先写死) COUNT 1 STREAMS stream.orders 0
                     List<MapRecord<String, Object, Object>> read = stringRedisTemplate.opsForStream().read(
-                            Consumer.from("g1", "c1"),
+                            Consumer.from(ORDER_CONSUMER_GROUP, consumerName),
                             StreamReadOptions.empty().count(1),
-                            StreamOffset.create(queueName, ReadOffset.from("0"))
+                            StreamOffset.create(ORDER_STREAM_KEY, ReadOffset.from("0"))
                     );
 
                     //2.判断消息是否获取成功
@@ -131,14 +174,18 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     //4.若成功，可以下单
                     handleVocherOrder(voucherOrder);
                     //5.ACK确认 SACK stream.orders g1 id
-                    stringRedisTemplate.opsForStream().acknowledge(queueName,"g1",record.getId());
+                    stringRedisTemplate.opsForStream().acknowledge(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, record.getId());
 
                 } catch (Exception e) {
+                    if (!running.get()) {
+                        break;
+                    }
                     log.error("处理pending-list订单异常",e);
                     try {
                         Thread.sleep(20);
                     } catch (InterruptedException ex) {
-                        throw new RuntimeException(ex);
+                        Thread.currentThread().interrupt();
+                        break;
                     }
                 }
             }
