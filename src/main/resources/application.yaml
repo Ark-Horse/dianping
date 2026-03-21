@@ -20,6 +20,15 @@ spring:
         time-between-eviction-runs: 10s
   jackson:
     default-property-inclusion: non_null # JSON处理时忽略非空字段
+  rabbitmq:
+    host: 192.168.10.128
+    port: 5672
+    username: ark
+    password: 123
+    listener:
+      simple:
+        acknowledge-mode: auto
+        prefetch: 1
 mybatis-plus:
   type-aliases-package: com.hmdp.entity # 别名扫描包
 logging:
