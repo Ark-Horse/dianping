@@ -21,6 +21,7 @@ public class VoucherOrderListener {
     public void handleVoucherOrder(VoucherOrder voucherOrder) {
         try {
             voucherOrderService.handleVoucherOrder(voucherOrder);
+            voucherOrderService.clearPendingOrder(voucherOrder.getId());
         } catch (Exception e) {
             log.error("处理RabbitMQ订单消息异常", e);
             throw e;

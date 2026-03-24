@@ -36,6 +36,12 @@ logging:
     com.hmdp: debug
 
 hmdp:
+  seckill:
+    compensation:
+      cron: "*/30 * * * * ?"
+      batch-size: 100
+      max-retry: 8
+      base-delay-seconds: 30
   cache:
     caffeine:
       enabled: true

@@ -14,14 +14,22 @@ import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import javax.annotation.Resource;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import static com.hmdp.config.RabbitMQConfig.VOUCHER_ORDER_QUEUE;
+import static com.hmdp.utils.RedisConstants.SECKILL_PENDING_ORDER_DEAD_KEY;
+import static com.hmdp.utils.RedisConstants.SECKILL_PENDING_ORDER_IDX_KEY;
+import static com.hmdp.utils.RedisConstants.SECKILL_PENDING_ORDER_KEY;
 
 /**
  * <p>
@@ -34,6 +42,8 @@ import static com.hmdp.config.RabbitMQConfig.VOUCHER_ORDER_QUEUE;
 @Service
 @Slf4j
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
+
+    private static final long PENDING_TTL_MINUTES = 30L;
 
     @Resource
     private ISeckillVoucherService seckillVoucherService;
@@ -67,9 +77,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         //3.获取锁
         boolean isLock = lock.tryLock();
         if (!isLock){
-            //获取锁失败，返回错误或重试
-            log.error("只能一人一单呢~~~");
-            return;
+            // 获取锁失败时抛异常，交给 MQ 重试或补偿任务处理
+            throw new IllegalStateException("获取用户订单锁失败，稍后重试");
         }
 
 
@@ -107,10 +116,18 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         voucherOrder.setId(orderId);
         voucherOrder.setUserId(userId);
         voucherOrder.setVoucherId(voucherId);
-        rabbitTemplate.convertAndSend(VOUCHER_ORDER_QUEUE, voucherOrder);
+
+        // 先登记待补偿订单，再发消息，避免发送失败时无迹可查
+        long now = System.currentTimeMillis();
+        recordPendingOrder(voucherOrder, now, 0, now + TimeUnit.SECONDS.toMillis(30));
+        try {
+            rabbitTemplate.convertAndSend(VOUCHER_ORDER_QUEUE, voucherOrder);
+        } catch (Exception e) {
+            log.error("发送秒杀订单消息失败，已记录待补偿订单，orderId={}", orderId, e);
+        }
 
         //3.返回订单id
-        return Result.ok(0);
+        return Result.ok(orderId);
 
     }
 
@@ -144,6 +161,119 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         save(voucherOrder);
 
 
+    }
+
+    public void clearPendingOrder(Long orderId) {
+        String orderIdStr = String.valueOf(orderId);
+        stringRedisTemplate.delete(SECKILL_PENDING_ORDER_KEY + orderIdStr);
+        stringRedisTemplate.opsForZSet().remove(SECKILL_PENDING_ORDER_IDX_KEY, orderIdStr);
+    }
+
+    public void compensatePendingOrders(int batchSize, int maxRetry, long baseDelaySeconds) {
+        long now = System.currentTimeMillis();
+        Set<String> dueOrderIds = stringRedisTemplate.opsForZSet().rangeByScore(
+                SECKILL_PENDING_ORDER_IDX_KEY,
+                0,
+                now,
+                0,
+                batchSize
+        );
+        if (dueOrderIds == null || dueOrderIds.isEmpty()) {
+            return;
+        }
+
+        for (String orderIdStr : dueOrderIds) {
+            String pendingKey = SECKILL_PENDING_ORDER_KEY + orderIdStr;
+            Map<Object, Object> pendingData = stringRedisTemplate.opsForHash().entries(pendingKey);
+            if (pendingData == null || pendingData.isEmpty()) {
+                stringRedisTemplate.opsForZSet().remove(SECKILL_PENDING_ORDER_IDX_KEY, orderIdStr);
+                continue;
+            }
+
+            Long orderId = parseLong(pendingData.get("orderId"));
+            Long userId = parseLong(pendingData.get("userId"));
+            Long voucherId = parseLong(pendingData.get("voucherId"));
+            Integer retryCount = parseInt(pendingData.get("retryCount"));
+
+            if (orderId == null || userId == null || voucherId == null || retryCount == null) {
+                log.error("待补偿订单数据非法，移入死信集合，orderId={}", orderIdStr);
+                moveToDead(orderIdStr);
+                continue;
+            }
+
+                boolean exists = lambdaQuery()
+                    .eq(VoucherOrder::getUserId, userId)
+                    .eq(VoucherOrder::getVoucherId, voucherId)
+                    .count() > 0;
+            if (exists) {
+                clearPendingOrder(orderId);
+                continue;
+            }
+
+            if (retryCount >= maxRetry) {
+                log.error("待补偿订单重试次数超限，移入死信，orderId={}, retryCount={}", orderId, retryCount);
+                moveToDead(orderIdStr);
+                continue;
+            }
+
+            VoucherOrder voucherOrder = new VoucherOrder();
+            voucherOrder.setId(orderId);
+            voucherOrder.setUserId(userId);
+            voucherOrder.setVoucherId(voucherId);
+
+            try {
+                rabbitTemplate.convertAndSend(VOUCHER_ORDER_QUEUE, voucherOrder);
+                long nextRetryTime = now + TimeUnit.SECONDS.toMillis(baseDelaySeconds * (1L << retryCount));
+                recordPendingOrder(voucherOrder, now, retryCount + 1, nextRetryTime);
+            } catch (Exception e) {
+                log.error("补偿重发消息失败，orderId={}", orderId, e);
+                long nextRetryTime = now + TimeUnit.SECONDS.toMillis(baseDelaySeconds * (1L << retryCount));
+                recordPendingOrder(voucherOrder, now, retryCount + 1, nextRetryTime);
+            }
+        }
+    }
+
+    private void recordPendingOrder(VoucherOrder voucherOrder, long now, int retryCount, long nextRetryTime) {
+        String orderIdStr = String.valueOf(voucherOrder.getId());
+        String pendingKey = SECKILL_PENDING_ORDER_KEY + orderIdStr;
+        Map<String, String> data = new HashMap<>(8);
+        data.put("orderId", orderIdStr);
+        data.put("userId", String.valueOf(voucherOrder.getUserId()));
+        data.put("voucherId", String.valueOf(voucherOrder.getVoucherId()));
+        data.put("retryCount", String.valueOf(retryCount));
+        data.put("createdAt", String.valueOf(now));
+        data.put("nextRetryTime", String.valueOf(nextRetryTime));
+
+        stringRedisTemplate.opsForHash().putAll(pendingKey, data);
+        stringRedisTemplate.expire(pendingKey, PENDING_TTL_MINUTES, TimeUnit.MINUTES);
+        stringRedisTemplate.opsForZSet().add(SECKILL_PENDING_ORDER_IDX_KEY, orderIdStr, nextRetryTime);
+    }
+
+    private void moveToDead(String orderIdStr) {
+        clearPendingOrder(Long.valueOf(orderIdStr));
+        stringRedisTemplate.opsForSet().add(SECKILL_PENDING_ORDER_DEAD_KEY, orderIdStr);
+    }
+
+    private Long parseLong(Object value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Long.valueOf(String.valueOf(value));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Integer parseInt(Object value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(String.valueOf(value));
+        } catch (Exception e) {
+            return null;
+        }
     }
 
 }

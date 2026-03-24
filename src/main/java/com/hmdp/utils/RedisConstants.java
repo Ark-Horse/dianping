@@ -25,4 +25,8 @@ public class RedisConstants {
     public static final String FEED_KEY = "feed:";
     public static final String SHOP_GEO_KEY = "shop:geo:";
     public static final String USER_SIGN_KEY = "sign:";
+
+    public static final String SECKILL_PENDING_ORDER_KEY = "seckill:pending:order:";
+    public static final String SECKILL_PENDING_ORDER_IDX_KEY = "seckill:pending:idx";
+    public static final String SECKILL_PENDING_ORDER_DEAD_KEY = "seckill:pending:dead";
 }
