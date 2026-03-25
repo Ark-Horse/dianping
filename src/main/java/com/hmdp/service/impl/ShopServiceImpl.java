@@ -7,6 +7,7 @@ import cn.hutool.json.JSONUtil;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.mapper.ShopMapper;
+import com.hmdp.service.CacheInvalidationService;
 import com.hmdp.service.IShopService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.utils.CacheClient;
@@ -38,6 +39,9 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     @Resource
     private CacheClient cacheClient;
+
+    @Resource
+    private CacheInvalidationService cacheInvalidationService;
 
     @Override
     public Result queryById(Long id) {
@@ -231,9 +235,13 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         }
         //1.更新数据库
         updateById(shop);
-        //2.删除缓存
-        stringRedisTemplate.delete(RedisConstants.CACHE_SHOP_KEY + id);
-        cacheClient.invalidateLocalCache(RedisConstants.CACHE_SHOP_KEY + id);
+        //2.发布缓存失效事件，由消费端统一处理 L1/L2 失效与重试
+        cacheInvalidationService.publishInvalidationEvent(
+            "shop",
+            String.valueOf(id),
+            RedisConstants.CACHE_SHOP_KEY + id,
+            "delete"
+        );
         return Result.ok();
     }
 

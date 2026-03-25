@@ -43,6 +43,12 @@ hmdp:
       max-retry: 8
       base-delay-seconds: 30
   cache:
+    invalidation:
+      compensation:
+        cron: "*/30 * * * * ?"
+        batch-size: 100
+        max-retry: 8
+        base-delay-seconds: 30
     caffeine:
       enabled: true
       max-size: 10000

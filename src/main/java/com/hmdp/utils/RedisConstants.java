@@ -29,4 +29,9 @@ public class RedisConstants {
     public static final String SECKILL_PENDING_ORDER_KEY = "seckill:pending:order:";
     public static final String SECKILL_PENDING_ORDER_IDX_KEY = "seckill:pending:idx";
     public static final String SECKILL_PENDING_ORDER_DEAD_KEY = "seckill:pending:dead";
+
+    public static final String CACHE_INVALIDATION_PENDING_KEY = "cache:invalidation:pending:";
+    public static final String CACHE_INVALIDATION_PENDING_IDX_KEY = "cache:invalidation:pending:idx";
+    public static final String CACHE_INVALIDATION_DEAD_KEY = "cache:invalidation:dead";
+    public static final String CACHE_INVALIDATION_IDEMPOTENT_KEY = "cache:invalidation:idempotent:";
 }
